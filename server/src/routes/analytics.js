@@ -421,6 +421,21 @@ You MUST follow this exact schema:
 
   } catch (err) {
     console.error("Gemini AI generation failed:", err);
+
+    const leakedKey =
+      err?.status === 403 &&
+      (
+        /reported as leaked/i.test(err?.message || '') ||
+        /reported as leaked/i.test(err?.errorDetails || '')
+      );
+
+    if (leakedKey) {
+      return res.status(503).json({
+        error: 'Gemini API key was reported as leaked. Replace GEMINI_API_KEY or GOOGLE_API_KEY in the server environment and restart the server.',
+        needsConfiguration: true,
+      });
+    }
+
     res.status(500).json({ error: 'Failed to compute AI growth insights.', details: err.message });
   }
 });
