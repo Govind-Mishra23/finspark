@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>InsightX Integration Demo</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="http://localhost:5050/sdk/insightx.js"></script>
+    <script defer src="./script.js"></script>
+  </head>
+  <body>
+    <div class="bg-orb orb-1"></div>
+    <div class="bg-orb orb-2"></div>
+
+    <main class="container">
+      <header class="hero card">
+        <p class="eyebrow">FinSpark x InsightX</p>
+        <h1>Integration Demo Website</h1>
+        <p class="subtext">
+          This standalone page shows how any product can integrate InsightX
+          telemetry in minutes. Configure credentials, initialize SDK, and
+          trigger events.
+        </p>
+      </header>
+
+      <section class="card grid two-col">
+        <div>
+          <h2>1) Configure SDK</h2>
+          <label class="field-label" for="endpoint">Backend Endpoint</label>
+          <input id="endpoint" type="text" value="http://localhost:5050" />
+
+          <label class="field-label" for="apiKey">Tenant API Key</label>
+          <input id="apiKey" type="text" placeholder="ixk_..." />
+
+          <label class="field-label" for="tenantId">Tenant Name</label>
+          <input id="tenantId" type="text" placeholder="demo_bank" />
+
+          <div class="controls">
+            <button id="initBtn" class="btn primary">Initialize SDK</button>
+            <button id="grantBtn" class="btn">Grant Consent</button>
+          </div>
+          <p id="sdkStatus" class="status">SDK status: not initialized</p>
+        </div>
+
+        <div>
+          <h2>2) Track Product Events</h2>
+          <div class="button-grid">
+            <button class="btn event" data-insightx-event="Loan_Apply_Clicked">
+              Loan Apply Clicked
+            </button>
+            <button
+              class="btn event"
+              data-insightx-event="Document_Upload_Started"
+            >
+              Document Upload Started
+            </button>
+            <button
+              class="btn event"
+              data-insightx-event="KYC_Verification_Started"
+            >
+              KYC Verification Started
+            </button>
+            <button class="btn event" data-insightx-event="Loan_Approved">
+              Loan Approved
+            </button>
+          </div>
+
+          <form id="searchForm" class="mini-form">
+            <label class="field-label" for="searchInput"
+              >Demo Custom Event Payload</label
+            >
+            <div class="inline-row">
+              <input
+                id="searchInput"
+                type="text"
+                placeholder="Search query..."
+                required
+              />
+              <button class="btn accent" type="submit">Track Search</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>3) Local Event Console</h2>
+        <p class="subtext">
+          Events tracked from this page appear here instantly and are sent to
+          your InsightX backend.
+        </p>
+        <ul id="eventLog" class="event-log"></ul>
+      </section>
+
+      <footer class="footer">
+        <p>
+          Tip: Login to your main dashboard and refresh Analytics pages to see
+          these events.
+        </p>
+      </footer>
+    </main>
+  </body>
+</html>
