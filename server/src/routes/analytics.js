@@ -3,6 +3,196 @@ const router = express.Router();
 const { getEventModel } = require('../models/Event');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+const AI_REPORT_CACHE_TTL_MS = Number(process.env.AI_REPORT_CACHE_TTL_MS || 120000);
+const AI_QUOTA_COOLDOWN_MS = Number(process.env.AI_QUOTA_COOLDOWN_MS || 60000);
+const AI_GENERATION_TIMEOUT_MS = Number(process.env.AI_GENERATION_TIMEOUT_MS || 45000); // 45s to give Gemini enough time
+const DEFAULT_GEMINI_MODEL_CANDIDATES = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash-latest',
+  'gemini-1.5-pro-latest',
+  'gemini-1.5-flash-8b',
+];
+
+const aiGrowthCache = new Map();
+const aiGrowthQuotaCooldown = new Map();
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const parseRetryDelayMs = (err) => {
+  const retryInfo = err?.errorDetails?.find((d) => d?.['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
+  const retryDelay = retryInfo?.retryDelay;
+  if (!retryDelay || typeof retryDelay !== 'string') return null;
+
+  const match = retryDelay.match(/^(\d+)(?:\.(\d+))?s$/);
+  if (!match) return null;
+
+  const seconds = Number(match[1]);
+  const fraction = match[2] ? Number(`0.${match[2]}`) : 0;
+  return Math.max(0, Math.round((seconds + fraction) * 1000));
+};
+
+const isQuotaExceededError = (err) => {
+  const msg = (err?.message || '').toLowerCase();
+  return err?.status === 429 || msg.includes('quota') || msg.includes('too many requests');
+};
+
+const isModelUnavailableError = (err) => {
+  const msg = (err?.message || '').toLowerCase();
+  return (
+    err?.status === 404 ||
+    msg.includes('not found for api version') ||
+    msg.includes('is not found for api version') ||
+    msg.includes('model not found') ||
+    msg.includes('unsupported for generatecontent')
+  );
+};
+
+const getGeminiModelCandidates = () => {
+  const envModel = (process.env.GEMINI_MODEL || '').trim();
+  const envCandidates = (process.env.GEMINI_MODEL_CANDIDATES || '')
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean);
+
+  const ordered = [
+    ...(envModel ? [envModel] : []),
+    ...envCandidates,
+    ...DEFAULT_GEMINI_MODEL_CANDIDATES,
+  ];
+
+  return [...new Set(ordered)];
+};
+
+const buildAiGrowthCacheKey = (tenantId, days) => `${tenantId}:${days}`;
+
+const getCachedAiGrowth = (cacheKey) => {
+  const cached = aiGrowthCache.get(cacheKey);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    aiGrowthCache.delete(cacheKey);
+    return null;
+  }
+  return cached.payload;
+};
+
+const setCachedAiGrowth = (cacheKey, payload, ttlMs = AI_REPORT_CACHE_TTL_MS) => {
+  aiGrowthCache.set(cacheKey, {
+    payload,
+    expiresAt: Date.now() + ttlMs,
+  });
+};
+
+const getQuotaCooldownRemainingMs = (cacheKey) => {
+  const until = aiGrowthQuotaCooldown.get(cacheKey) || 0;
+  if (until <= Date.now()) {
+    aiGrowthQuotaCooldown.delete(cacheKey);
+    return 0;
+  }
+  return until - Date.now();
+};
+
+const setQuotaCooldown = (cacheKey, delayMs = AI_QUOTA_COOLDOWN_MS) => {
+  const safeDelay = Math.max(1000, delayMs);
+  aiGrowthQuotaCooldown.set(cacheKey, Date.now() + safeDelay);
+};
+
+const withTimeout = async (promise, timeoutMs) => {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const timeoutError = new Error('Gemini generation timed out');
+          timeoutError.code = 'AI_TIMEOUT';
+          reject(timeoutError);
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+const logAiGrowthResponse = (tenantId, source, payload, extras = {}) => {
+  const timestamp = new Date().toISOString();
+  console.log(`[ai-growth][${timestamp}][tenant=${tenantId}][source=${source}]`, extras);
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(JSON.stringify({ source, rawMetrics: payload?.rawMetrics, aiMeta: payload?.ai, _debug: payload?._debug }, null, 2));
+  }
+};
+
+const buildQuotaFallbackReport = (metrics) => {
+  const { applyClicked, documentUpload, kycStarted, loanApproved } = metrics.funnel;
+  const applyToDocDrop = applyClicked > 0 ? Math.round(((applyClicked - documentUpload) / applyClicked) * 100) : 0;
+  const docToKycDrop = documentUpload > 0 ? Math.round(((documentUpload - kycStarted) / documentUpload) * 100) : 0;
+  const kycToApprovalDrop = kycStarted > 0 ? Math.round(((kycStarted - loanApproved) / kycStarted) * 100) : 0;
+  const conversionRate = applyClicked > 0 ? Math.round((loanApproved / applyClicked) * 100) : 0;
+
+  const stageDrops = [
+    { stage: 'Apply to Document Upload', value: applyToDocDrop },
+    { stage: 'Document Upload to KYC', value: docToKycDrop },
+    { stage: 'KYC to Approval', value: kycToApprovalDrop }
+  ];
+  const highestDrop = stageDrops.sort((a, b) => b.value - a.value)[0];
+
+  return {
+    criticalIssues: [
+      `${highestDrop.stage} has the highest funnel leakage at ${highestDrop.value}%.`,
+      `Overall approval conversion is currently ${conversionRate}% from apply to approved.`
+    ],
+    performanceSummary: `AI quota was temporarily exceeded, so this report is generated from deterministic rules over live telemetry. You have ${metrics.activeUsers} active users and ${metrics.totalEvents} events, with ${metrics.topFeature.replace(/_/g, ' ')} as the top interaction.`,
+    funnelAnalysis: `Drop-offs are Apply->Document ${applyToDocDrop}%, Document->KYC ${docToKycDrop}%, and KYC->Approval ${kycToApprovalDrop}%. Prioritize instrumentation and UX improvements at the largest drop stage to improve end-to-end conversion.`,
+    anomalies: [
+      metrics.topFeatureCount <= 1
+        ? 'Top feature usage is very low, indicating shallow product engagement.'
+        : `Top feature concentration: ${metrics.topFeature.replace(/_/g, ' ')} was used ${metrics.topFeatureCount} times.`,
+      applyClicked > 0 && loanApproved === 0
+        ? 'Applications are starting but no approvals are being completed.'
+        : 'No severe data anomaly detected beyond normal funnel leakage.'
+    ],
+    recommendations: [
+      {
+        title: `Fix ${highestDrop.stage} friction`,
+        description: 'Review event payloads, form validation failures, and API latency around this step. Add session replay or verbose diagnostics for abandonment reasons.',
+        impact: 'High'
+      },
+      {
+        title: 'Improve completion nudges',
+        description: 'Trigger contextual reminders for users who start but do not complete the next required funnel step within 10-30 minutes.',
+        impact: 'Medium'
+      }
+    ],
+    growthOpportunities: [
+      'A/B test a shorter application flow with progressive disclosure of optional fields.',
+      'Build segmented onboarding journeys for first-time vs returning applicants based on event history.'
+    ]
+  };
+};
+
+const generateWithRetry = async (model, prompt, maxAttempts = 3) => {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await model.generateContent(prompt);
+    } catch (err) {
+      lastError = err;
+
+      if (!isQuotaExceededError(err) || attempt === maxAttempts) {
+        throw err;
+      }
+
+      const suggestedDelay = parseRetryDelayMs(err);
+      const backoffDelay = suggestedDelay ?? 1000 * (2 ** (attempt - 1));
+      await sleep(backoffDelay);
+    }
+  }
+
+  throw lastError;
+};
+
 // GET /api/analytics/feature-usage — Aggregated feature usage counts
 router.get('/feature-usage', async (req, res) => {
   try {
@@ -313,9 +503,11 @@ router.get('/ai-growth', async (req, res) => {
       return res.status(503).json({ error: 'Gemini API Key is missing in the backend environment.', needsConfiguration: true });
     }
 
-    const { days = 30 } = req.query;
+    const days = Number(req.query.days || 30);
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    const Event = getEventModel(req.tenant._id.toString());
+    const tenantId = req.tenant._id.toString();
+    const cacheKey = buildAiGrowthCacheKey(tenantId, days);
+    const Event = getEventModel(tenantId);
     const match = { timestamp: { $gte: since } };
 
     // Gather crucial data points
@@ -354,7 +546,7 @@ router.get('/ai-growth', async (req, res) => {
 
     // If there's barely any data, AI won't be useful
     if (metrics.activeUsers < 1 || metrics.funnel.applyClicked === 0) {
-      return res.json({ 
+      const payload = {
         data: {
           criticalIssues: ["Insufficient Tracking Volume"],
           performanceSummary: "There is insufficient data to generate a meaningful predictive AI health check. Start simulating more traffic to unlock deeper insights.",
@@ -363,13 +555,64 @@ router.get('/ai-growth', async (req, res) => {
           recommendations: [{ title: "Drive Traffic", description: "Use your live integration or the Loan Demo App more heavily to generate actionable interaction data.", impact: "High" }],
           growthOpportunities: ["Launch marketing campaigns to establish a baseline traction metric."]
         },
-        rawMetrics: metrics
-      });
+        rawMetrics: metrics,
+        ai: { status: 'insufficient-data', provider: 'none', fallback: true },
+        _debug: {
+          source: 'insufficient-data',
+          model: null,
+          generatedAt: new Date().toISOString(),
+          hint: 'Use the Loan Demo App or trigger more events via the SDK to populate analytics data.',
+        }
+      };
+      logAiGrowthResponse(tenantId, 'insufficient-data', payload);
+      return res.json(payload);
     }
 
-    // Initialize Gemini
+    const cachedPayload = getCachedAiGrowth(cacheKey);
+    if (cachedPayload) {
+      // Annotate with cache hit info in debug
+      const cachedWithDebug = {
+        ...cachedPayload,
+        _debug: {
+          ...(cachedPayload._debug || {}),
+          cachedAt: new Date().toISOString(),
+          source: cachedPayload._debug?.source ? `${cachedPayload._debug.source} (cache-hit)` : 'cache-hit',
+        }
+      };
+      logAiGrowthResponse(tenantId, 'cache-hit', cachedWithDebug);
+      return res.json(cachedWithDebug);
+    }
+
+    const modelCandidates = getGeminiModelCandidates();
+    const preferredModel = modelCandidates[0] || 'gemini-2.5-flash';
+    const cooldownRemainingMs = getQuotaCooldownRemainingMs(cacheKey);
+    if (cooldownRemainingMs > 0) {
+      const fallbackPayload = {
+        data: buildQuotaFallbackReport(metrics),
+        rawMetrics: metrics,
+        ai: {
+          status: 'quota-cooldown',
+          provider: 'gemini',
+          fallback: true,
+          cooldownRemainingMs,
+        },
+        _debug: {
+          source: 'quota-cooldown',
+          model: preferredModel,
+          triedModels: modelCandidates,
+          generatedAt: new Date().toISOString(),
+          retryAfterMs: cooldownRemainingMs,
+          hint: `Quota cooldown active. Retry in ${Math.round(cooldownRemainingMs / 1000)}s.`,
+        }
+      };
+      setCachedAiGrowth(cacheKey, fallbackPayload, Math.min(cooldownRemainingMs, AI_REPORT_CACHE_TTL_MS));
+      logAiGrowthResponse(tenantId, 'quota-cooldown', fallbackPayload);
+      return res.json(fallbackPayload);
+    }
+
+    // Initialize Gemini and try model candidates in order until one succeeds.
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+    console.log(`[ai-growth] Initiating Gemini call. candidates=${modelCandidates.join(',')} timeout=${AI_GENERATION_TIMEOUT_MS}ms tenant=${tenantId}`);
 
     const prompt = `
 You are an expert AI Product Manager and SaaS Growth Consultant specializing in FinTech applications.
@@ -406,37 +649,203 @@ You MUST follow this exact schema:
 }
 `;
 
-    const aiResponse = await model.generateContent(prompt);
-    let text = aiResponse.response.text().trim();
-    
-    // Safety check just in case Gemini hallucinates markdown blocks
-    if (text.startsWith('```json')) {
-      text = text.substring(7, text.length - 3).trim();
-    } else if (text.startsWith('```')) {
-      text = text.substring(3, text.length - 3).trim();
+    const aiStartMs = Date.now();
+    let selectedModelName = null;
+    let attemptedModels = [];
+    try {
+      let aiResponse = null;
+      let lastModelError = null;
+
+      for (const candidateModel of modelCandidates) {
+        attemptedModels.push(candidateModel);
+        const candidateStartMs = Date.now();
+        const candidate = genAI.getGenerativeModel({ model: candidateModel });
+
+        try {
+          console.log(`[ai-growth] Trying Gemini model=${candidateModel} tenant=${tenantId}`);
+          aiResponse = await withTimeout(
+            generateWithRetry(candidate, prompt),
+            AI_GENERATION_TIMEOUT_MS
+          );
+          selectedModelName = candidateModel;
+          break;
+        } catch (candidateErr) {
+          const candidateDurationMs = Date.now() - candidateStartMs;
+          console.warn(`[ai-growth] Gemini model failed. model=${candidateModel} duration=${candidateDurationMs}ms reason=${candidateErr?.message || candidateErr}`);
+          lastModelError = candidateErr;
+
+          if (isModelUnavailableError(candidateErr)) {
+            continue;
+          }
+
+          candidateErr.modelCandidate = candidateModel;
+          throw candidateErr;
+        }
+      }
+
+      if (!aiResponse) {
+        const unsupportedModelsError = lastModelError || new Error('No Gemini model candidates are configured.');
+        unsupportedModelsError.triedModels = attemptedModels;
+        throw unsupportedModelsError;
+      }
+
+      const aiDurationMs = Date.now() - aiStartMs;
+      let text = aiResponse.response.text().trim();
+
+      // Safety check just in case Gemini wraps in markdown code blocks
+      if (text.startsWith('```json')) {
+        text = text.substring(7, text.length - 3).trim();
+      } else if (text.startsWith('```')) {
+        text = text.substring(3, text.length - 3).trim();
+      }
+
+      const report = JSON.parse(text);
+      const payload = {
+        data: report,
+        rawMetrics: metrics,
+        ai: { status: 'ok', provider: 'gemini', model: selectedModelName, fallback: false },
+        _debug: {
+          source: 'gemini-live',
+          model: selectedModelName,
+          triedModels: attemptedModels,
+          durationMs: aiDurationMs,
+          timeoutMs: AI_GENERATION_TIMEOUT_MS,
+          cachedAt: null,
+          generatedAt: new Date().toISOString(),
+          apiKeyPrefix: apiKey ? `${apiKey.slice(0, 8)}...` : 'missing',
+        }
+      };
+      setCachedAiGrowth(cacheKey, payload);
+      logAiGrowthResponse(tenantId, 'gemini-success', payload, { durationMs: aiDurationMs });
+      return res.json(payload);
+    } catch (aiErr) {
+      const aiDurationMs = Date.now() - aiStartMs;
+      console.error(`[ai-growth] Gemini error after ${aiDurationMs}ms:`, aiErr?.message || aiErr);
+
+      if (aiErr?.code === 'AI_TIMEOUT') {
+        const resolvedModel = selectedModelName || aiErr?.modelCandidate || preferredModel;
+        const fallbackPayload = {
+          data: buildQuotaFallbackReport(metrics),
+          rawMetrics: metrics,
+          ai: {
+            status: 'timeout-fallback',
+            provider: 'gemini',
+            model: resolvedModel,
+            fallback: true,
+            timeoutMs: AI_GENERATION_TIMEOUT_MS,
+          },
+          _debug: {
+            source: 'timeout-fallback',
+            model: resolvedModel,
+            triedModels: attemptedModels,
+            durationMs: aiDurationMs,
+            timeoutMs: AI_GENERATION_TIMEOUT_MS,
+            error: `AI timed out after ${aiDurationMs}ms`,
+            generatedAt: new Date().toISOString(),
+            apiKeyPrefix: apiKey ? `${apiKey.slice(0, 8)}...` : 'missing',
+            hint: 'Increase AI_GENERATION_TIMEOUT_MS in .env or check Gemini API latency',
+          }
+        };
+        setCachedAiGrowth(cacheKey, fallbackPayload, Math.min(15000, AI_REPORT_CACHE_TTL_MS));
+        logAiGrowthResponse(tenantId, 'timeout-fallback', fallbackPayload, { durationMs: aiDurationMs });
+        return res.json(fallbackPayload);
+      }
+
+      if (isQuotaExceededError(aiErr)) {
+        const resolvedModel = selectedModelName || aiErr?.modelCandidate || preferredModel;
+        const retryMs = parseRetryDelayMs(aiErr) || AI_QUOTA_COOLDOWN_MS;
+        setQuotaCooldown(cacheKey, Math.max(retryMs, AI_QUOTA_COOLDOWN_MS));
+        const fallbackPayload = {
+          data: buildQuotaFallbackReport(metrics),
+          rawMetrics: metrics,
+          ai: {
+            status: 'quota-exceeded',
+            provider: 'gemini',
+            model: resolvedModel,
+            fallback: true,
+            retryAfterMs: retryMs,
+          },
+          _debug: {
+            source: 'quota-exceeded-fallback',
+            model: resolvedModel,
+            triedModels: attemptedModels,
+            durationMs: aiDurationMs,
+            timeoutMs: AI_GENERATION_TIMEOUT_MS,
+            error: aiErr?.message,
+            generatedAt: new Date().toISOString(),
+            apiKeyPrefix: apiKey ? `${apiKey.slice(0, 8)}...` : 'missing',
+            retryAfterMs: retryMs,
+            hint: 'Quota exceeded. Wait for cooldown or upgrade Gemini tier.',
+          }
+        };
+        setCachedAiGrowth(cacheKey, fallbackPayload, Math.min(Math.max(retryMs, 1000), AI_REPORT_CACHE_TTL_MS));
+        logAiGrowthResponse(tenantId, 'quota-exceeded-fallback', fallbackPayload, { durationMs: aiDurationMs });
+        return res.json(fallbackPayload);
+      }
+      throw aiErr;
     }
 
-    const report = JSON.parse(text);
-    res.json({ data: report, rawMetrics: metrics });
-
   } catch (err) {
-    console.error("Gemini AI generation failed:", err);
+    console.error('[ai-growth] Fatal error:', err?.message || err);
+
+    const errMsg = (err?.message || '').toLowerCase();
+    const errDetails = typeof err?.errorDetails === 'string' ? err.errorDetails.toLowerCase() : '';
 
     const leakedKey =
       err?.status === 403 &&
-      (
-        /reported as leaked/i.test(err?.message || '') ||
-        /reported as leaked/i.test(err?.errorDetails || '')
-      );
+      (/reported as leaked/i.test(errMsg) || /reported as leaked/i.test(errDetails));
 
     if (leakedKey) {
       return res.status(503).json({
-        error: 'Gemini API key was reported as leaked. Replace GEMINI_API_KEY or GOOGLE_API_KEY in the server environment and restart the server.',
+        error: 'Gemini API key was reported as leaked by Google. Set a fresh GEMINI_API_KEY in server/.env and restart the server.',
         needsConfiguration: true,
+        _debug: {
+          source: 'leaked-key-error',
+          apiKeyPrefix: (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').slice(0, 8) + '...',
+          hint: 'Generate a new Gemini API key at https://aistudio.google.com/app/apikey and update GEMINI_API_KEY in server/.env',
+        }
       });
     }
 
-    res.status(500).json({ error: 'Failed to compute AI growth insights.', details: err.message });
+    const keyInvalid = err?.status === 400 && /api key not valid/i.test(errMsg);
+    if (keyInvalid) {
+      return res.status(503).json({
+        error: 'Gemini API key is invalid. Check GEMINI_API_KEY in server/.env.',
+        needsConfiguration: true,
+        _debug: {
+          source: 'invalid-key-error',
+          hint: 'Generate a new Gemini API key at https://aistudio.google.com/app/apikey and update GEMINI_API_KEY in server/.env',
+        }
+      });
+    }
+
+    if (isModelUnavailableError(err)) {
+      const tried = Array.isArray(err?.triedModels) && err.triedModels.length
+        ? err.triedModels.join(', ')
+        : getGeminiModelCandidates().join(', ');
+
+      return res.status(503).json({
+        error: 'No configured Gemini model is currently available for generateContent.',
+        needsConfiguration: true,
+        _debug: {
+          source: 'model-unavailable-error',
+          errorMessage: err?.message,
+          triedModels: tried,
+          hint: 'Set GEMINI_MODEL or GEMINI_MODEL_CANDIDATES in server/.env to a supported model from Google AI Studio ListModels output.',
+        }
+      });
+    }
+
+    res.status(500).json({
+      error: 'Failed to compute AI growth insights.',
+      details: err.message,
+      _debug: {
+        source: 'fatal-error',
+        errorType: err?.constructor?.name || 'Error',
+        errorMessage: err?.message,
+        hint: 'Check server logs for details',
+      }
+    });
   }
 });
 

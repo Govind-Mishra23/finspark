@@ -20,6 +20,15 @@ import {
   ArrowRight,
   Zap,
   CheckCircle2,
+  Bug,
+  X,
+  RefreshCw,
+  AlertTriangle,
+  CheckCircle,
+  Clock,
+  Cpu,
+  Key,
+  WifiOff,
 } from "lucide-react";
 
 // ── Reusable "Read More" wrapper ──────────────────────────────────────────────
@@ -93,16 +102,180 @@ const impactStyle = {
   Low: "bg-gray-100 text-gray-600",
 };
 
+// ── Debug Console Panel ───────────────────────────────────────────────────────
+function DebugConsole({ debugData, aiMeta, rawMetrics, onClose }) {
+  const source = debugData?.source || aiMeta?.status || "unknown";
+  const isLive = source === "gemini-live" && !aiMeta?.fallback;
+  const isFallback = aiMeta?.fallback === true;
+  const isTimeout = source === "timeout-fallback";
+  const isQuota =
+    source === "quota-exceeded-fallback" || aiMeta?.status === "quota-exceeded";
+
+  const statusColor = isLive
+    ? "text-emerald-600 bg-emerald-50 border-emerald-200"
+    : isTimeout
+      ? "text-amber-600 bg-amber-50 border-amber-200"
+      : isQuota
+        ? "text-orange-600 bg-orange-50 border-orange-200"
+        : "text-gray-600 bg-gray-50 border-gray-200";
+
+  const statusIcon = isLive ? (
+    <CheckCircle size={14} className="text-emerald-500" />
+  ) : isTimeout ? (
+    <Clock size={14} className="text-amber-500" />
+  ) : isQuota ? (
+    <WifiOff size={14} className="text-orange-500" />
+  ) : (
+    <AlertTriangle size={14} className="text-gray-500" />
+  );
+
+  return (
+    <div className="fixed bottom-4 right-4 z-50 w-96 bg-gray-950 text-gray-100 rounded-2xl border border-gray-800 shadow-2xl overflow-hidden font-mono text-xs">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-2.5 bg-gray-900 border-b border-gray-800">
+        <div className="flex items-center gap-2">
+          <Bug size={14} className="text-indigo-400" />
+          <span className="font-bold text-indigo-300 tracking-wider uppercase text-[10px]">
+            AI Debug Console
+          </span>
+        </div>
+        <button
+          onClick={onClose}
+          className="text-gray-500 hover:text-gray-200 transition-colors"
+        >
+          <X size={14} />
+        </button>
+      </div>
+
+      {/* Status */}
+      <div className="px-4 py-3 border-b border-gray-800">
+        <div
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-bold ${statusColor}`}
+        >
+          {statusIcon}
+          {isLive
+            ? "✅ LIVE AI Response"
+            : isFallback
+              ? `⚠️ FALLBACK (${source})`
+              : source}
+        </div>
+        {isFallback && (
+          <p className="mt-2 text-amber-400 text-[10px] leading-relaxed">
+            ⚠️ This report was generated from deterministic rules, NOT from the
+            real Model.
+            {debugData?.hint && ` Hint: ${debugData.hint}`}
+          </p>
+        )}
+      </div>
+
+      {/* Fields */}
+      <div className="px-4 py-3 space-y-1.5">
+        <DebugRow
+          icon={<Cpu size={11} />}
+          label="Model"
+          value={debugData?.model ? "Configured (hidden)" : "unknown"}
+        />
+        <DebugRow
+          icon={<Key size={11} />}
+          label="API Key Prefix"
+          value={debugData?.apiKeyPrefix || "hidden"}
+        />
+        <DebugRow
+          icon={<Clock size={11} />}
+          label="Duration"
+          value={
+            debugData?.durationMs != null ? `${debugData.durationMs}ms` : "—"
+          }
+          highlight={debugData?.durationMs > 30000}
+        />
+        <DebugRow
+          icon={<Clock size={11} />}
+          label="Timeout Cap"
+          value={
+            debugData?.timeoutMs != null ? `${debugData.timeoutMs}ms` : "—"
+          }
+        />
+        <DebugRow label="Generated At" value={debugData?.generatedAt || "—"} />
+        {debugData?.error && (
+          <DebugRow label="Error" value={debugData.error} isError />
+        )}
+        {debugData?.retryAfterMs && (
+          <DebugRow
+            label="Retry After"
+            value={`${Math.round(debugData.retryAfterMs / 1000)}s`}
+          />
+        )}
+        {rawMetrics && (
+          <>
+            <div className="border-t border-gray-800 pt-1.5 mt-1.5">
+              <span className="text-gray-500 text-[10px] uppercase tracking-wider">
+                Raw Metrics
+              </span>
+            </div>
+            <DebugRow label="Active Users" value={rawMetrics.activeUsers} />
+            <DebugRow label="Total Events" value={rawMetrics.totalEvents} />
+            <DebugRow
+              label="Top Feature"
+              value={rawMetrics.topFeature?.replace(/_/g, " ") || "—"}
+            />
+            <DebugRow
+              label="Apply Clicked"
+              value={rawMetrics.funnel?.applyClicked ?? "—"}
+            />
+            <DebugRow
+              label="Loan Approved"
+              value={rawMetrics.funnel?.loanApproved ?? "—"}
+            />
+          </>
+        )}
+      </div>
+
+      {/* Footer tip */}
+      <div className="px-4 py-2 bg-gray-900 border-t border-gray-800 text-gray-500 text-[10px]">
+        Server:{" "}
+        <code className="text-indigo-400">GET /api/analytics/ai-growth</code> ·
+        Check server logs for full trace
+      </div>
+    </div>
+  );
+}
+
+function DebugRow({ icon, label, value, isError, highlight }) {
+  return (
+    <div className="flex items-start gap-1.5">
+      {icon && <span className="text-gray-500 mt-0.5 shrink-0">{icon}</span>}
+      <span className="text-gray-500 shrink-0 w-28">{label}:</span>
+      <span
+        className={`break-all ${
+          isError
+            ? "text-red-400"
+            : highlight
+              ? "text-amber-400"
+              : "text-gray-200"
+        }`}
+      >
+        {String(value)}
+      </span>
+    </div>
+  );
+}
+
+// ── Main Page ─────────────────────────────────────────────────────────────────
 export default function AiGrowthReport() {
   const { auth, currentTenant } = useTenant();
   const [report, setReport] = useState(null);
   const [rawMetrics, setRawMetrics] = useState(null);
+  const [aiMeta, setAiMeta] = useState(null);
+  const [debugData, setDebugData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [showDebug, setShowDebug] = useState(false);
 
   const tenantApiKey = auth?.apiKey || currentTenant?.apiKey || null;
 
   const generateReport = async () => {
+    if (loading) return;
+
     if (!tenantApiKey) {
       setError("Please sign in before generating an AI growth report.");
       return;
@@ -110,8 +283,11 @@ export default function AiGrowthReport() {
 
     setLoading(true);
     setError(null);
+    setShowDebug(false);
     try {
+      // 60s timeout — gives server enough time for provider response + its own 45s timeout
       const res = await api.get("/analytics/ai-growth", {
+        timeout: 60000,
         headers: {
           "x-api-key": tenantApiKey,
           ...(auth?.role === "admin" ? { "x-admin-key": tenantApiKey } : {}),
@@ -119,22 +295,36 @@ export default function AiGrowthReport() {
       });
       setReport(res.data.data);
       setRawMetrics(res.data.rawMetrics);
+      setAiMeta(res.data.ai || null);
+      setDebugData(res.data._debug || null);
+
+      // Auto-open debug if it's a fallback response
+      if (res.data.ai?.fallback) {
+        setShowDebug(true);
+      }
     } catch (err) {
+      // Attach debug info from error response if available
+      if (err.response?.data?._debug) {
+        setDebugData(err.response.data._debug);
+        setShowDebug(true);
+      }
+
       if (
         err.response?.status === 503 &&
         err.response?.data?.needsConfiguration
       ) {
-        setError(
+        const msg =
           err.response?.data?.error ||
-            "Gemini is not configured correctly for AI growth reports.",
-        );
+          "AI provider is not configured correctly.";
+        const hint = err.response?.data?._debug?.hint || "";
+        setError(`${msg}${hint ? ` → ${hint}` : ""}`);
       } else if (
         err.response?.status === 403 &&
         /leaked/i.test(err.response?.data?.error || "")
       ) {
         setError(
           err.response?.data?.error ||
-            "Gemini rejected the configured API key. Replace it in the server environment.",
+            "AI provider rejected the configured API key (reported as leaked). Replace GEMINI_API_KEY in server/.env and restart.",
         );
       } else if (err.response?.status === 403) {
         setError(
@@ -145,6 +335,10 @@ export default function AiGrowthReport() {
         setError(
           err.response?.data?.error ||
             "Missing tenant authorization. Please sign in again.",
+        );
+      } else if (err.code === "ECONNABORTED") {
+        setError(
+          "Request timed out after 60s. The AI provider may be slow — please try again. If this persists, check network connectivity.",
         );
       } else {
         setError(
@@ -188,6 +382,10 @@ export default function AiGrowthReport() {
       content += `- ${g}\n`;
     });
 
+    if (aiMeta) {
+      content += `\n--- AI Metadata ---\nModel: hidden\nSource: ${aiMeta.status}\nFallback: ${aiMeta.fallback ? "Yes (deterministic)" : "No (live AI)"}\n`;
+    }
+
     const blob = new Blob([content], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -205,7 +403,7 @@ export default function AiGrowthReport() {
       <div>
         <PageHeader
           title="DeepInsight AI"
-          subtitle="Powered by Gemini 2.5 Flash — cognitive analysis of your tracking data."
+          subtitle="Powered by an advanced AI model — cognitive analysis of your tracking data."
         />
         <div className="flex flex-col items-center justify-center p-12 mt-6 bg-gradient-to-br from-white to-indigo-50/40 rounded-2xl border border-indigo-100 text-center shadow-sm">
           <div className="w-16 h-16 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl shadow-lg shadow-indigo-200 flex items-center justify-center mb-5">
@@ -221,17 +419,51 @@ export default function AiGrowthReport() {
           </p>
           <button
             onClick={generateReport}
+            disabled={loading}
+            id="generate-ai-report-btn"
             className="flex items-center gap-2 px-5 py-2.5 bg-gray-900 hover:bg-gray-800 text-white rounded-xl font-bold shadow-lg transition-all hover:-translate-y-0.5 text-sm"
           >
             <Sparkles size={16} className="text-indigo-400" />
             Generate Analysis
           </button>
           {error && (
-            <p className="mt-4 p-3 bg-red-50 text-red-600 rounded-xl font-medium border border-red-100 text-xs">
-              {error}
-            </p>
+            <div className="mt-4 p-4 bg-red-50 text-red-700 rounded-xl border border-red-100 text-xs text-left w-full max-w-lg">
+              <div className="flex items-start gap-2">
+                <AlertTriangle
+                  size={14}
+                  className="shrink-0 mt-0.5 text-red-500"
+                />
+                <div>
+                  <p className="font-bold mb-1">Error generating AI report</p>
+                  <p className="leading-relaxed">{error}</p>
+                  {debugData?.hint && (
+                    <p className="mt-2 text-red-500 font-medium">
+                      💡 {debugData.hint}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
           )}
         </div>
+
+        {/* Debug toggle even before report is loaded */}
+        {debugData && (
+          <button
+            onClick={() => setShowDebug((s) => !s)}
+            className="fixed bottom-4 right-4 z-40 flex items-center gap-1.5 px-3 py-2 bg-gray-950 text-indigo-300 rounded-xl text-xs font-bold shadow-lg border border-gray-800 hover:bg-gray-900 transition-colors"
+          >
+            <Bug size={13} /> Debug
+          </button>
+        )}
+        {showDebug && debugData && (
+          <DebugConsole
+            debugData={debugData}
+            aiMeta={null}
+            rawMetrics={null}
+            onClose={() => setShowDebug(false)}
+          />
+        )}
       </div>
     );
 
@@ -241,7 +473,7 @@ export default function AiGrowthReport() {
       <div>
         <PageHeader
           title="DeepInsight AI"
-          subtitle="Powered by Gemini 2.5 Flash."
+          subtitle="Powered by an advanced AI model."
         />
         <div className="flex flex-col items-center justify-center p-20 mt-6 bg-white rounded-2xl border border-gray-100 shadow-sm">
           <div className="relative w-16 h-16 mb-5">
@@ -258,7 +490,7 @@ export default function AiGrowthReport() {
             Compiling analysis…
           </h3>
           <p className="text-gray-400 text-xs mt-1">
-            Parsing funnel metrics and growth vectors
+            Querying AI engine · this can take up to 45 seconds
           </p>
         </div>
       </div>
@@ -273,24 +505,70 @@ export default function AiGrowthReport() {
         )
       : 0;
 
+  const isFallback = aiMeta?.fallback === true;
+  const isLiveAI = !isFallback && aiMeta?.status === "ok";
+
   // ── Report view ─────────────────────────────────────────────────────────────
   return (
     <div className="space-y-5 animate-in fade-in slide-in-from-bottom-6 duration-500">
       <PageHeader
         title="DeepInsight AI"
-        subtitle="Powered by Gemini 2.5 Flash — cognitive analysis of your tracking data."
+        subtitle="Powered by an advanced AI model — cognitive analysis of your tracking data."
       />
 
       {/* Action bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white px-4 py-3 rounded-xl border border-gray-200 shadow-sm">
-        <div className="flex items-center gap-2 text-sm font-semibold text-gray-700">
-          <span className="relative flex h-2 w-2">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
-          </span>
-          Analysis complete
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+            <span className="relative flex h-2 w-2">
+              <span
+                className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${isLiveAI ? "bg-emerald-400" : "bg-amber-400"}`}
+              />
+              <span
+                className={`relative inline-flex rounded-full h-2 w-2 ${isLiveAI ? "bg-emerald-500" : "bg-amber-500"}`}
+              />
+            </span>
+            {isLiveAI ? "Live AI Analysis" : "Fallback Report (Deterministic)"}
+          </div>
+
+          {/* AI source badge */}
+          {aiMeta && (
+            <span
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold border ${
+                isLiveAI
+                  ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                  : "bg-amber-50 text-amber-700 border-amber-200"
+              }`}
+            >
+              {isLiveAI ? (
+                <CheckCircle size={10} />
+              ) : (
+                <AlertTriangle size={10} />
+              )}
+              {isLiveAI ? "AI Model Active" : `Fallback · ${aiMeta.status}`}
+            </span>
+          )}
+
+          {isFallback && (
+            <span className="text-[10px] text-amber-600 italic">
+              ⚠️ Not a real AI response — shows rule-based metrics
+            </span>
+          )}
         </div>
+
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowDebug((s) => !s)}
+            id="debug-console-btn"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors border ${
+              showDebug
+                ? "bg-indigo-600 text-white border-indigo-700"
+                : "bg-gray-100 text-gray-600 border-gray-200 hover:bg-gray-200"
+            }`}
+          >
+            <Bug size={12} />
+            Debug
+          </button>
           <button
             onClick={downloadReport}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold shadow-md shadow-indigo-200 transition-colors"
@@ -299,12 +577,35 @@ export default function AiGrowthReport() {
           </button>
           <button
             onClick={generateReport}
-            className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-bold transition-colors"
+            disabled={loading}
+            id="recalculate-report-btn"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-bold transition-colors"
           >
+            <RefreshCw size={12} />
             Recalculate
           </button>
         </div>
       </div>
+
+      {/* Fallback warning banner */}
+      {isFallback && (
+        <div className="flex items-start gap-3 p-4 bg-amber-50 border border-amber-200 rounded-xl">
+          <AlertTriangle size={16} className="text-amber-600 shrink-0 mt-0.5" />
+          <div className="text-sm">
+            <p className="font-bold text-amber-800 mb-0.5">
+              Showing Fallback Report
+            </p>
+            <p className="text-amber-700 text-xs leading-relaxed">
+              {aiMeta?.status === "timeout-fallback"
+                ? `The AI provider took longer than ${(debugData?.timeoutMs || 45000) / 1000}s to respond. The data below is computed from deterministic rules, not real AI. Try recalculating — response time may improve next time.`
+                : aiMeta?.status === "quota-exceeded"
+                  ? `AI provider quota was exceeded. Retry available in ${Math.round((debugData?.retryAfterMs || 60000) / 1000)}s. The data below is computed from deterministic rules.`
+                  : `The real AI response was unavailable (${aiMeta?.status}). The data below is computed from deterministic rules.`}{" "}
+              Click <strong>Debug</strong> for technical details.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* KPI tiles */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -344,9 +645,16 @@ export default function AiGrowthReport() {
             <div className="absolute top-0 right-0 w-40 h-40 bg-indigo-500/20 rounded-full blur-3xl pointer-events-none" />
             <div className="relative z-10">
               <div className="flex items-center gap-2 mb-2">
-                <Zap size={14} className="text-indigo-400" />
-                <span className="text-[10px] font-bold uppercase tracking-widest text-indigo-400">
-                  AI Performance Readout
+                <Zap
+                  size={14}
+                  className={isLiveAI ? "text-indigo-400" : "text-amber-400"}
+                />
+                <span
+                  className={`text-[10px] font-bold uppercase tracking-widest ${isLiveAI ? "text-indigo-400" : "text-amber-400"}`}
+                >
+                  {isLiveAI
+                    ? "AI Performance Readout — Live AI"
+                    : "AI Performance Readout — Deterministic Fallback"}
                 </span>
               </div>
               <ReadMoreText
@@ -558,6 +866,16 @@ export default function AiGrowthReport() {
         </div>
         {/* /Right */}
       </div>
+
+      {/* Floating debug console */}
+      {showDebug && debugData && (
+        <DebugConsole
+          debugData={debugData}
+          aiMeta={aiMeta}
+          rawMetrics={rawMetrics}
+          onClose={() => setShowDebug(false)}
+        />
+      )}
     </div>
   );
 }
